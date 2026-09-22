@@ -51,9 +51,9 @@ def _parse_value(text: str) -> Any:
 
     A value wrapped in matching single or double quotes is returned as the
     literal inner string with no coercion — the escape hatch for strings the
-    heuristics would otherwise claim (``-P effort="'none'"`` sends the literal
-    wire string ``none`` through parsing, while bare ``effort=none`` parses to
-    Python ``None`` and is normalized by effort-taking components).
+    heuristics would otherwise claim (``-P effort="'none'"`` returns the string
+    ``none`` untouched, while bare ``effort=none`` parses to Python ``None``;
+    effort-taking components normalize both to the minimum reasoning level).
     """
     if len(text) >= 2 and text[0] == text[-1] and text[0] in ("'", '"'):
         return text[1:-1]
