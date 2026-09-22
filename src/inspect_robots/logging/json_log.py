@@ -23,16 +23,26 @@ import uuid
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+import numpy as np
+
 if TYPE_CHECKING:
     from inspect_robots.log import EvalLog, EvalSpec
     from inspect_robots.rollout import TrialRecord
     from inspect_robots.types import Action, Observation, StepResult
 
 _SLUG_RE = re.compile(r"[^a-z0-9]+")
+# Leaves room for the filename's "_" + 8 hex chars + ".json.tmp" suffix inside a
+# 255-byte name, with headroom for filesystems that allow less.
+_SLUG_MAX = 200
 
 
 def _slug(name: str) -> str:
-    return _SLUG_RE.sub("-", name.lower()).strip("-") or "eval"
+    # Capped so the derived filename stays inside the 255-byte limit even for a
+    # long task name: on_eval_end runs after every trial, so an ENAMETOOLONG
+    # there would lose the whole finished run. The name itself is preserved in
+    # the log body, and the filename's uuid suffix keeps distinct runs distinct
+    # even when two long names truncate to the same slug.
+    return _SLUG_RE.sub("-", name.lower()).strip("-")[:_SLUG_MAX].strip("-") or "eval"
 
 
 def _sanitize(obj: object) -> object:
@@ -42,8 +52,9 @@ def _sanitize(obj: object) -> object:
     literals for them (``default=`` never fires for floats), which RFC 8259
     parsers reject.
     """
-    if isinstance(obj, float):
-        return obj if math.isfinite(obj) else None
+    if isinstance(obj, (float, np.floating)):
+        val = float(obj)
+        return val if math.isfinite(val) else None
     if isinstance(obj, dict):
         return {key: _sanitize(value) for key, value in obj.items()}
     if isinstance(obj, (list, tuple)):

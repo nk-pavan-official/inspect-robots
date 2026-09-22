@@ -2470,31 +2470,84 @@ def test_on_demand_prompt_and_no_tool_nudge_describe_chaining() -> None:
     )
 
 
-def test_effort_defaults_low_and_is_tunable(tmp_path: Path) -> None:
+def test_effort_passthrough_matrix(tmp_path: Path) -> None:
     script = _Script([_tool_response("done", {"summary": "ok"})])
     logs = ir_eval(_task(), _policy(script), CubePickEmbodiment(), log_dir=str(tmp_path))
-    # Robot control is latency-sensitive: low effort by default (guardrails
-    # sit below the model, so this trades thinking time, not safety).
-    assert script.requests[0]["reasoning_effort"] == "low"
-    assert logs[0].eval.policy_config["effort"] == "low"
-
-    script = _Script([_tool_response("done", {"summary": "ok"})])
-    ir_eval(_task(), _policy(script, effort="high"), CubePickEmbodiment(), log_dir=str(tmp_path))
-    assert script.requests[0]["reasoning_effort"] == "high"
-
-    script = _Script([_tool_response("done", {"summary": "ok"})])
-    ir_eval(_task(), _policy(script, effort=None), CubePickEmbodiment(), log_dir=str(tmp_path))
     assert "reasoning_effort" not in script.requests[0]
+    assert logs[0].eval.policy_config["effort"] is None
 
-    # "none" is a wire value, distinct from None (omit the field): GPT-5.x
-    # rejects function tools on chat completions unless reasoning_effort is
-    # explicitly "none", and omitting the field 400s the same way.
     script = _Script([_tool_response("done", {"summary": "ok"})])
-    ir_eval(_task(), _policy(script, effort="none"), CubePickEmbodiment(), log_dir=str(tmp_path))
+    logs = ir_eval(
+        _task(),
+        _policy(script, effort=None),
+        CubePickEmbodiment(),
+        log_dir=str(tmp_path),
+    )
     assert script.requests[0]["reasoning_effort"] == "none"
+    assert logs[0].eval.policy_config["effort"] == "none"
 
-    with pytest.raises(ConfigError, match=r"or None to omit the field, got 'turbo'"):
+    script = _Script([_tool_response("done", {"summary": "ok"})])
+    logs = ir_eval(
+        _task(),
+        _policy(script, effort="none"),
+        CubePickEmbodiment(),
+        log_dir=str(tmp_path),
+    )
+    assert script.requests[0]["reasoning_effort"] == "none"
+    assert logs[0].eval.policy_config["effort"] == "none"
+
+    script = _Script([_tool_response("done", {"summary": "ok"})])
+    logs = ir_eval(
+        _task(),
+        _policy(script, effort="high"),
+        CubePickEmbodiment(),
+        log_dir=str(tmp_path),
+    )
+    assert script.requests[0]["reasoning_effort"] == "high"
+    assert logs[0].eval.policy_config["effort"] == "high"
+
+    with pytest.raises(ConfigError) as invalid:
         _policy(_Script([]), effort="turbo")
+    assert str(invalid.value) == (
+        "effort must be one of ['high', 'low', 'max', 'medium', 'minimal', 'none', "
+        "'xhigh'], or a number in [0.0, 1.0) on servers that take a fractional "
+        "effort, got 'turbo'.\nfix: omit -P effort= to use the provider default"
+    )
+
+    live_kwargs: dict[str, Any] = {
+        "model": "m",
+        "base_url": "ws://stub.test",
+        "wire": "gemini-live",
+        "wire_capture": False,
+        "env": {},
+    }
+    with pytest.raises(ConfigError, match="effort is not supported"):
+        LLMAgentPolicy(**live_kwargs, effort=None)
+    with pytest.raises(ConfigError, match="effort is not supported"):
+        LLMAgentPolicy(**live_kwargs, effort="low")
+    live = LLMAgentPolicy(**live_kwargs)
+    assert live.config.effort is None
+
+
+def test_fractional_effort_is_passed_through_and_bounded(tmp_path: Path) -> None:
+    # Tinker's OpenAI-compatible endpoint reads effort as a fraction, so a number
+    # reaches the wire as a number instead of being snapped to a named level.
+    script = _Script([_tool_response("done", {"summary": "ok"})])
+    policy = _policy(script, effort=0.7)
+    logs = ir_eval(_task(), policy, CubePickEmbodiment(), log_dir=str(tmp_path))
+    assert script.requests[0]["reasoning_effort"] == 0.7
+    assert logs[0].eval.policy_config["effort"] == 0.7
+
+    # `-P effort=0` parses to int 0, which is zero effort, not an omitted field.
+    script = _Script([_tool_response("done", {"summary": "ok"})])
+    ir_eval(_task(), _policy(script, effort=0), CubePickEmbodiment(), log_dir=str(tmp_path))
+    assert script.requests[0]["reasoning_effort"] == 0.0
+
+    # 1.0 is past the top of the range every probed server accepts, and a bool is
+    # a mistyped flag rather than a fraction (`-P effort=false` parses to False).
+    for rejected in (1.0, -0.1, float("nan"), float("inf"), True, False, "0.7"):
+        with pytest.raises(ConfigError, match=r"a number in \[0\.0, 1\.0\)"):
+            _policy(_Script([]), effort=rejected)
 
 
 def test_registry_resolves_agent_policy() -> None:
@@ -2738,3 +2791,38 @@ def test_chat_wire_usage_metadata_counts_calls_only(tmp_path: Path) -> None:
     )
 
     assert sink.records[0].metadata["llm_usage"] == {"llm_calls": 2}
+
+
+@pytest.mark.parametrize(
+    "param, val",
+    [
+        ("model", 42),
+        ("model", 0),
+        ("base_url", True),
+        ("base_url", False),
+        ("api_key_env", True),
+        ("api_key_env", False),
+        ("speed", False),
+    ],
+)
+def test_non_string_params_rejected(param: str, val: Any) -> None:
+    kwargs: dict[str, Any] = {
+        "model": "test-model",
+        "base_url": "http://localhost:8000",
+        "api_key_env": "TEST_KEY",
+        "effort": "low",
+        "speed": None,
+        "wire": "chat",
+    }
+    kwargs[param] = val
+
+    # speed requires wire='anthropic'
+    if param == "speed":
+        kwargs["wire"] = "anthropic"
+
+    with pytest.raises(ConfigError) as exc_info:
+        LLMAgentPolicy(**kwargs)
+
+    assert f"{param} must be a string, got {val!r}." in str(exc_info.value)
+    expected_fix = f"fix: the -P parser coerces unquoted values; pass -P '{param}=\"value\"'"
+    assert expected_fix in str(exc_info.value)

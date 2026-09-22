@@ -143,9 +143,20 @@ def test_optional_fields_omitted_when_unset() -> None:
     _client(handler).complete([_USER], [])
 
     body = json.loads(seen[0].content)
+    assert body["thinking"] == {"type": "adaptive"}
     assert "tools" not in body
     assert "output_config" not in body
     assert "system" not in body
+
+
+def test_none_effort_disables_thinking_without_output_config() -> None:
+    seen, handler = _capture(_anthropic_response(_text("hi"), stop_reason="end_turn"))
+
+    _client(handler).complete([_USER], [], reasoning_effort="none")
+
+    body = json.loads(seen[0].content)
+    assert body["thinking"] == {"type": "disabled"}
+    assert "output_config" not in body
 
 
 def test_temperature_forwarded_when_set() -> None:
@@ -163,6 +174,17 @@ def test_fast_mode_sends_speed_and_beta_header() -> None:
 
     assert json.loads(seen[0].content)["speed"] == "fast"
     assert seen[0].headers["anthropic-beta"] == "fast-mode-2026-02-01"
+
+
+def test_fast_mode_passes_through_with_none_effort() -> None:
+    seen, handler = _capture(_anthropic_response(_text("hi"), stop_reason="end_turn"))
+
+    _client(handler, speed="fast").complete([_USER], [], reasoning_effort="none")
+
+    body = json.loads(seen[0].content)
+    assert body["speed"] == "fast"
+    assert body["thinking"] == {"type": "disabled"}
+    assert "output_config" not in body
 
 
 def test_empty_api_key_omits_header() -> None:
@@ -751,8 +773,25 @@ def test_effort_4xx_names_the_accepted_values() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(400, text="output_config.effort: invalid value 'minimal'")
 
-    with pytest.raises(RuntimeError, match=r"none and minimal are OpenAI-only values"):
+    with pytest.raises(RuntimeError) as excinfo:
         _client(handler).complete([_USER], [], reasoning_effort="minimal")
+
+    assert "minimal is an OpenAI-only value" in str(excinfo.value)
+    assert "none and minimal" not in str(excinfo.value)
+
+
+def test_fractional_effort_is_sent_verbatim_and_its_4xx_names_the_wire_that_takes_it() -> None:
+    seen, ok_handler = _capture(_anthropic_response(_text("hi"), stop_reason="end_turn"))
+    _client(ok_handler).complete([_USER], [], reasoning_effort=0.7)
+    # Passed through unquantized: the level set is not this wire's only vocabulary
+    # to a gateway that forwards a fraction on.
+    assert json.loads(seen[0].content)["output_config"] == {"effort": 0.7}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(422, text="output_config.effort: Input should be 'low', 'medium'")
+
+    with pytest.raises(RuntimeError, match=r"a fractional effort needs -P wire=chat"):
+        _client(handler).complete([_USER], [], reasoning_effort=0.7)
 
 
 def test_temperature_guidance_only_when_temperature_was_sent() -> None:
@@ -1071,7 +1110,8 @@ def test_unknown_wire_lists_only_canonical_names() -> None:
         _policy(wire="unknown")
 
     assert str(excinfo.value) == (
-        "wire must be one of ['chat', 'gemini-live', 'messages', 'responses'], got 'unknown'"
+        "wire must be one of ['chat', 'gemini-live', 'interactions', 'messages', "
+        "'responses'], got 'unknown'"
     )
 
 
@@ -1248,20 +1288,19 @@ def test_variant_strip_keeps_fine_tune_colons() -> None:
         )
 
 
-@pytest.mark.parametrize("api_key_env", [None, "", False, 0, 0.0])
+@pytest.mark.parametrize("api_key_env", [None, ""])
 def test_falsy_api_key_env_does_not_send_the_openrouter_key_to_a_gateway(
-    api_key_env: object,
+    api_key_env: str | None,
 ) -> None:
-    # '-P api_key_env=' parses to '', and 'false'/'0' to other falsy values,
-    # all of which resolve_provider treats as unset and answers with
-    # $OPENROUTER_API_KEY. An `is None` test would hand a third-party gateway
-    # the OpenRouter secret.
+    # '-P api_key_env=' parses to '', which resolve_provider treats as unset
+    # and answers with $OPENROUTER_API_KEY. An `is None` test would hand a
+    # third-party gateway the OpenRouter secret.
     seen, handler = _capture(_anthropic_response(_text("ok"), stop_reason="end_turn"))
     policy = LLMAgentPolicy(
         model="claude-opus-5",
         wire="messages",
         base_url="https://gw.example/v1",
-        api_key_env=api_key_env,  # type: ignore[arg-type]
+        api_key_env=api_key_env,
         transport=httpx.MockTransport(handler),
         env={"ANTHROPIC_API_KEY": "sk-ant", "OPENROUTER_API_KEY": "sk-or"},
     )

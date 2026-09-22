@@ -27,6 +27,7 @@ from inspect_robots.embodiment import (
     EmbodimentInfo,
 )
 from inspect_robots.eval import eval, eval_set
+from inspect_robots.grader import Grader, operator_grader, vlm_grader
 from inspect_robots.log import (
     EvalLog,
     EvalResults,
@@ -36,13 +37,24 @@ from inspect_robots.log import (
     read_eval_log,
 )
 from inspect_robots.policy import Policy, PolicyBase, PolicyConfig, PolicyInfo
-from inspect_robots.registry import embodiment, policy, registered, resolve, scorer, sink, task
+from inspect_robots.registry import (
+    embodiment,
+    grader,
+    operator_input,
+    policy,
+    registered,
+    resolve,
+    scorer,
+    sink,
+    task,
+)
 from inspect_robots.rollout import TrialRecord
 from inspect_robots.scene import Scene, Target
 from inspect_robots.scorer import (
     Score,
     Scorer,
     episode_length,
+    is_affirmative_verdict,
     min_distance_to_goal,
     operator_scorer,
     reached_goal_state,
@@ -59,6 +71,7 @@ from inspect_robots.spaces import (
     StateSpec,
 )
 from inspect_robots.task import Epochs, Task, TaskEnvelope
+from inspect_robots.taskgen import generate_scene
 from inspect_robots.types import OPERATOR_END, Action, ActionChunk, Observation, StepResult
 
 # The public, stability-guaranteed API. Anything not listed here (or prefixed
@@ -82,6 +95,7 @@ __all__ = [
     "EvalResults",
     "EvalSpec",
     "EvalStats",
+    "Grader",
     "Observation",
     "ObservationSpace",
     "OperatorConsole",
@@ -108,7 +122,12 @@ __all__ = [
     "episode_length",
     "eval",
     "eval_set",
+    "generate_scene",
+    "grader",
+    "is_affirmative_verdict",
     "min_distance_to_goal",
+    "operator_grader",
+    "operator_input",
     "operator_scorer",
     "policy",
     "reached_goal_state",
@@ -119,4 +138,5 @@ __all__ = [
     "sink",
     "success_at_end",
     "task",
+    "vlm_grader",
 ]

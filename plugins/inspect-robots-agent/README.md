@@ -66,6 +66,22 @@ cannot be evicted by the client. Live usage counts include the empty resumed
 generation and the observation-triggered generation on a normal step, so
 input token totals cover two generations per step.
 
+### Gemini Interactions API
+
+Use Google's stateful HTTP API for GA Gemini models that do not support the
+Live wire, including `gemini-3.7-flash`:
+
+```bash
+inspect-robots "pick up the cube" --policy agent \
+    -P model=google/gemini-3.7-flash -P wire=interactions \
+    -P effort=low --embodiment cubepick
+```
+
+The Interactions wire sends only each new observation and tool result while
+Google retains the conversation history behind an interaction id. Leave
+`image_horizon` unset because frames already absorbed by that server-side
+history cannot be evicted client-side.
+
 The wire format defaults to Chat Completions for broad OpenAI-compatible
 endpoint support:
 
@@ -75,6 +91,7 @@ endpoint support:
 | `responses` | `/responses` | A direct OpenAI or compatible endpoint requires the Responses API |
 | `messages` (`anthropic` alias) | `/messages` | Anthropic, Tinker, or a compatible Messages endpoint |
 | `gemini-live` | `BidiGenerateContent` (WSS) | Google's Live API: required for the `-streaming-` robotics model ids |
+| `interactions` | `/interactions` | Google's stateful HTTP API: server-side history for GA Gemini models, e.g. `gemini-3.7-flash` |
 
 ## How it works
 
@@ -96,8 +113,9 @@ user reads these notes live and in the saved transcript to follow what the
 agent sees and decides.
 
 Camera images are attached to every observation by default
-(`-P images=always`). Set `-P images=on_demand` to send state without image
-payloads and give the model a `take_pic` tool instead:
+(`-P images=always`), though `inspect-robots setup` suggests `on_demand`. Set
+`-P images=on_demand` to send state without image payloads and give the model a
+`take_pic` tool instead:
 
 ```bash
 inspect-robots "pick up the cube" --policy agent \
@@ -257,7 +275,7 @@ be distinguishable, encode it in a named factory's qualname, for example
 Configuration knobs (all `-P key=value`): `model`, `base_url`, `api_key_env`,
 `wire`, `speed`, `max_output_tokens`, `max_llm_calls` (default `100`),
 `temperature`, `effort`, `max_speed_frac`, `transcript_echo`, `images`
-(default `always`; use `on_demand` for model-requested frames),
+(default `always`; use `on_demand` for model-requested frames; `inspect-robots setup` suggests `on_demand`),
 `image_horizon`, `depth` (default `render`; use `off` to omit depth
 renders), and `prior_learnings`.
 `speed` and `max_output_tokens` apply to `-P wire=messages` only, and passing
@@ -267,9 +285,11 @@ on Anthropic's API; Tinker accepts and silently ignores it.
 | Image option | Default | Behavior |
 |---|---|---|
 | `-P images=` | `always` | Attach every observation's frames; use `on_demand` for model-requested frames |
-| `-P image_horizon=` | `2` on HTTP wires | Keep frames from the newest two image-bearing messages in each outgoing request; unset on `gemini-live` |
+| `-P image_horizon=` | `2` on the stateless HTTP wires; unset on `gemini-live` and `interactions` | Keep frames from the newest two image-bearing messages in each outgoing request; unset on `gemini-live` and `interactions` |
 
-On the HTTP wires, set `-P image_horizon=none` to send the full image history.
+On the stateless HTTP wires, set `-P image_horizon=none` to send the full image
+history. `image_horizon` is unset and rejects an explicit value on
+`gemini-live` and `interactions`.
 Do not use a bare `-P image_horizon=`: the CLI parses it as an empty string,
 which the policy rejects. Full history grows request bodies by about 420 KB
 per observation with three cameras and can reach a 413 response around 85
@@ -308,17 +328,34 @@ integer token counters returned by the wire. The Messages wire
 includes input, output, cache-creation, and cache-read tokens; other wires
 currently record `llm_calls` only. Trials with no LLM calls omit the key.
 
-Reasoning effort defaults to `low` on the HTTP wires: robot control is
-latency-sensitive (the arm stands still while the model thinks), safety
-guardrails sit below the model either way, and frontier models at low effort
-remain strong at this task shape. Raise it for hard manipulation problems
-(`-P effort=high`) or pass `-P effort=none` to omit the parameter for
-endpoints that reject it (the CLI reads a bare `none` as null). To send the
-literal wire value `none` and disable reasoning, quote it:
-`-P effort="'none'"`. GPT-5.x on chat completions requires the literal `none`
-when function tools are in play (any other value, or omitting the field, is a
-400). In Python, `effort=None` omits the field and `effort="none"` sends the
-wire value. Gemini Live has no effort field, so leave it unset on that wire.
+Like `temperature`, reasoning effort is omitted when `-P effort=` is unset, so
+the provider's own default applies. Explicit named levels (`minimal`, `low`,
+`medium`, `high`, `xhigh`, and `max`) pass through unchanged. A bare
+`-P effort=none` now requests the true minimum on the stateless HTTP wires:
+
+| Wire | Request field |
+| --- | --- |
+| `chat` | `reasoning_effort: "none"` |
+| `responses` | `reasoning: {"effort": "none"}` |
+| `messages` | `thinking: {"type": "disabled"}` (no `output_config`) |
+
+On `wire=interactions`, `minimal`, `low`, `medium`, and `high` map to
+`generation_config.thinking_level`. Other named levels, `none`, and fractional
+effort are rejected because the accepted thinking levels are model-specific.
+
+The older quoted spelling, `-P effort="'none'"`, remains valid but is no longer
+needed. In Python, both `effort=None` and `effort="none"` request the `none`
+level; omit the argument to inherit the provider default. Gemini Live has no
+effort field and rejects any explicit effort, so leave it unset on that wire.
+To pin the behavior from before version 0.23, add `-P effort=low`.
+
+Effort also takes a number in `[0.0, 1.0)` for servers that read it as a
+fraction instead of a named level (`-P effort=0.7`). The number is sent
+unquantized, so an effort sweep keeps whatever resolution the server offers.
+Named levels stay the portable choice: every wire and provider accepts some of
+them, while fractional effort is accepted today only by Tinker's
+OpenAI-compatible endpoint (see below). A server that takes levels only rejects
+a fraction with a guided 4xx naming the wire that does accept one.
 
 ## Depth rendering
 
@@ -371,10 +408,23 @@ inspect-robots "pick up the cube" --policy agent \
     --embodiment cubepick
 ```
 
-The plugin defaults to `effort=low` for latency-sensitive robot control.
-Tinker's thinking-effort cookbook documents Inkling's own default as high, so
-pass `-P effort=` deliberately when comparing results. The endpoint accepts
-`low`, `medium`, `high`, `xhigh`, and `max`; it rejects `none` and `minimal`.
+With effort unset, Inkling inherits Tinker's own default, documented as high in
+the thinking-effort cookbook. That can increase control latency because the arm
+stands still while the model thinks; pass `-P effort=low` for latency-sensitive
+runs or to pin the plugin's pre-0.23 behavior. The endpoint accepts `low`,
+`medium`, `high`, `xhigh`, and `max`; `minimal` is unsupported. `effort=none`
+is sent as disabled thinking, which Tinker's endpoint has not been observed to
+accept — expect a wire rejection until confirmed otherwise.
+
+Fractional effort is a Tinker feature, but only on its OpenAI-compatible
+endpoint, which reads `reasoning_effort` as a number from `0.0` to `0.99`
+(`0.995` and above are a 422). The Messages endpoint that serves Inkling here
+takes named levels only, so `-P effort=0.7` needs
+`-P wire=chat -P base_url=` pointed at `.../tinker-prod/oai/api/v1`. That
+endpoint silently ignores `tools`, so it cannot currently drive a robot episode:
+the policy sees no tool call and fails after three turns. Treat fractional
+effort on Tinker as usable for prompt-level experiments, and named levels as the
+setting for real rollouts until the Messages endpoint accepts a number.
 
 Tinker currently reports `input_tokens: 0` because input usage appears in its
 cache-creation and cache-read counters. EvalLog input-token statistics and the
@@ -417,8 +467,10 @@ while standard quota sits idle. It is available on Claude Opus 5 and Opus 4.8,
 on the Claude API only: not Bedrock, Vertex, Foundry, or Claude Platform on
 AWS. A rejection that names fast mode is turned into an error naming the fix.
 
-This wire always requests adaptive thinking, which pre-4.6 models such as
-Sonnet 4.5 and Haiku 4.5 do not support. Use `-P wire=chat` for those.
+With effort unset or set to a named level, this wire requests adaptive
+thinking. Pre-4.6 models such as Sonnet 4.5 and Haiku 4.5 do not support
+adaptive thinking; pass `-P effort=none` to disable thinking and use them on
+`wire=messages`, or use `-P wire=chat`.
 
 The Messages API requires an output cap, so `-P max_output_tokens=` defaults to
 `16000` here. Thinking bills against that same cap, and a response truncated at
@@ -459,3 +511,7 @@ inspect-robots "pick up the cube" --policy agent \
     -P model=openai/gpt-5.6-sol -P wire=responses -P effort=medium \
     --embodiment cubepick
 ```
+
+To stay on Chat Completions and disable reasoning instead, pass
+`-P effort=none`. It sends the literal `reasoning_effort: "none"`; no nested
+quoting is required.

@@ -65,10 +65,11 @@ inspect-robots setup
 ```
 
 The wizard picks your defaults, finds your cameras, and asks about behavior
-toggles declared by the embodiment plugin, such as yam's `auto_start`, then
-writes `~/.config/inspect-robots/config.ini`. On a different rig, install its
-plugin instead and type its component names at the prompts; to write the config
-file by hand, see [the CLI guide](https://docs.inspectrobots.org/guide/cli/).
+toggles and numeric settings declared by the embodiment plugin, such as yam's
+`auto_start`, then writes `~/.config/inspect-robots/config.ini`. On a different
+rig, install its plugin instead and type its component names at the prompts; to
+write the config file by hand, see
+[the CLI guide](https://docs.inspectrobots.org/guide/cli/).
 
 The `molmoact2` policy is only a client: nothing moves until the MolmoAct2
 server is listening, and the server does not start itself or survive a
@@ -92,8 +93,9 @@ inspect-robots "place the fork on the plate"
 
 Every run opens a live Rerun viewer streaming the cameras, proprioception,
 and actions straight from the eval pipeline, so you watch exactly what the
-policy sees while the robot moves. CLI flags override any default
-(`--no-rerun`, `--no-store-frames`, `--max-steps 300`, ...).
+policy sees while the robot moves, and saves that stream as a replayable `.rrd`
+beside the eval log. CLI flags override any default (`--no-rerun-save`,
+`--no-rerun`, `--no-store-frames`, `--max-steps 300`, ...).
 
 ### Drive the robot with an LLM
 
@@ -143,6 +145,24 @@ inspect-robots run --policy agent --rerun-connect \
     -P effort=high \
     --instruction "place the fork on the plate"
 ```
+
+### Talk to the policy while it runs
+
+With the [voice plugin](plugins/inspect-robots-voice/) installed, `--voice`
+keeps the microphone open for the whole run and delivers each spoken remark to
+the policy at its next inference, transcribed locally (no keys, no network).
+Silence sends nothing, and voice is feedback-only: ending an episode and
+recording verdicts stay on the keyboard.
+
+```bash
+pip install inspect-robots-voice
+inspect-robots run --policy agent -P model=anthropic/claude-opus-5 \
+    --voice \
+    --instruction "place the fork on the plate"
+```
+
+Typed console feedback keeps working alongside; both land in the transcript
+and the eval log with their source recorded.
 
 ### Retry with learning
 
@@ -216,6 +236,9 @@ inspect-robots view logs/ --serve --host 0.0.0.0
 `--host 0.0.0.0` exposes the viewer to anyone who can reach the machine; they
 can view the logs, including embedded camera frames. The served index
 auto-refreshes as new runs arrive.
+
+Agent runs update their HTML report turn by turn while the run is active.
+Scores appear when the canonical final log replaces the running snapshot.
 
 ### More CLI commands
 
@@ -363,8 +386,8 @@ the compatibility check before anything moves, not mid-rollout.
 
 ## First-party plugins
 
-Both halves of an eval (the "body" and the "brain") have a ready-made
-adapter shipped from this repo as separate packages:
+Policies, embodiments, and attended operator input have ready-made plugins
+shipped from this repo as separate packages:
 
 - **[inspect-robots-ros](plugins/inspect-robots-ros/)**: run evals on ROS 1 or
   ROS 2 arms through rosbridge, with no ROS installation on the eval machine
@@ -386,6 +409,11 @@ adapter shipped from this repo as separate packages:
   code-as-policy agents against a joint-space embodiment. Model-generated
   Python calls separately served SAM3, Contact-GraspNet, and Pyroki helpers,
   then queues approver-checked joint targets behind `--policy capx`.
+- **[inspect-robots-voice](plugins/inspect-robots-voice/)**: transcribe local
+  microphone speech into operator feedback during attended runs with
+  `--voice`, or narrate streamed policy notes and terminal summaries with
+  `run --speak`. Spoken input is feedback-only, so trial end and verdicts stay
+  on the keyboard.
 
 ```bash
 # Isaac Lab world + a π0 checkpoint served by XPolicyLab, evaluated end to end:

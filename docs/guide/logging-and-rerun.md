@@ -21,6 +21,9 @@ a read-back guarantee: a newer Inspect Robots always reads an older log.
 Pressing Ctrl-C during a rollout writes a log with `status: "cancelled"` and
 everything gathered so far, including the partial trial record and transcript.
 
+To follow completed trials and the current policy conversation in a browser,
+see [Watching a run live](live-view.md).
+
 ## Sinks
 
 A [`LogSink`](/api/#inspect_robots.logging.sink.LogSink) observes the run lifecycle
@@ -28,6 +31,7 @@ A [`LogSink`](/api/#inspect_robots.logging.sink.LogSink) observes the run lifecy
 `on_eval_end`). Builtins:
 
 - [`JsonLogSink`](/api/#inspect_robots.logging.json_log.JsonLogSink): the default; the canonical JSON record.
+- [`LiveLogSink`](/api/#inspect_robots.logging.live_log.LiveLogSink): a transient, schema-valid running snapshot.
 - [`RerunSink`](/api/#inspect_robots.logging.rerun_sink.RerunSink): optional, lazily imported.
 
 Passing `sinks=` replaces the default `JsonLogSink`, it does not add to it.
@@ -38,6 +42,12 @@ from inspect_robots.logging import JsonLogSink, RerunSink
 
 eval(task, policy, embodiment, sinks=[JsonLogSink("logs"), RerunSink("run.rrd")])
 ```
+
+`eval_set(..., sinks=...)` reuses the same sink instances across its sequential
+task runs. Caller-supplied sinks must reset their run state in `on_eval_start`.
+A reused `LiveLogSink` removes the previous run's stale "running" snapshot at
+the next `on_eval_start`; through the Python API, the last task's orphan remains
+until that next start.
 
 ## Rerun visualization
 
@@ -67,7 +77,12 @@ instead of control: camera frames are dropped first, so scalar plots stay
 complete, then whole steps, and the totals are reported as a `RuntimeWarning`
 when the eval ends. The queue is drained at every trial boundary (bounded by
 `flush_timeout`), so an eval that aborts mid-run loses at most the current
-trial's queued tail; the JSON eval log is synchronous and never affected.
+trial's queued tail. A live viewer and its teed `.rrd` receive the same worker
+stream, so viewer-paced shedding reaches the file too. The `.rrd` records what
+the viewer received, not a guaranteed-complete record. For commanded motion,
+the `.rrd` is what the viewer saw; the actions JSONL is what the robot was told.
+The JSON eval log and action side-cars are written outside the Rerun worker and
+are never affected by its shedding.
 
 Camera frames are JPEG-compressed by default (`jpeg_quality=75`), which cuts
 viewer bandwidth by an order of magnitude. Pass `jpeg_quality=None` for
@@ -77,16 +92,31 @@ at stake either way: scoring reads from the `FrameStore` side-car, not from
 Rerun.
 
 ```python
-RerunSink("run.rrd")                   # record to a file, view later
-RerunSink(spawn=True)                  # live viewer on this machine (CLI: --rerun)
-RerunSink(spawn=True, spawn_port=9877) # chosen viewer port (CLI: --rerun-port 9877)
-RerunSink(connect_url="rerun+http://127.0.0.1:9876/proxy")  # stream to a running viewer
-RerunSink(spawn=True, jpeg_quality=None, queue_size=128)  # lossless, deeper buffer
+RerunSink("run.rrd")                              # record one fixed file
+RerunSink(recording_dir="logs")                  # fresh task_slug_xxxxxxxx.rrd per eval
+RerunSink(spawn=True, recording_dir="logs")      # local viewer plus file
+RerunSink(spawn=True, spawn_port=9877, recording_dir="logs")
+RerunSink(connect_url="rerun+http://127.0.0.1:9876/proxy", recording_dir="logs")
+RerunSink(spawn=True, jpeg_quality=None, queue_size=128)  # live only, lossless
 ```
 
-The three modes are mutually exclusive: rerun's `save`/`spawn`/`connect_grpc`
-calls each replace the SDK's global sink, so combining them raises `ValueError`
-rather than silently dropping a stream.
+File recording combines with either live mode through `set_sinks` in rerun-sdk
+0.24 or newer. With rerun-sdk 0.20 through 0.23, the sink warns once, continues
+the live view, and skips the teed file. Among the mode combinations, only
+`spawn=True` with `connect_url`, or `recording_path` with `recording_dir`,
+raises `ValueError`.
+
+For `inspect-robots run`, a live viewer or `--rerun-connect` saves a `.rrd` in
+the log directory by default. Replay it later with:
+
+```bash
+rerun logs/task_slug_xxxxxxxx.rrd
+```
+
+Use `--no-rerun-save` for a live-only run, or set `rerun_save = false` under
+`[defaults]` to make that the rig default. Use explicit `--rerun-save` without
+a live-view option to record only; `--rerun-save --no-rerun` also selects this
+headless mode. The CLI prints the resolved `.rrd` path after a completed eval.
 
 ### Live transcript in the viewer
 
@@ -110,8 +140,32 @@ viewer on your own machine instead and stream to it: `rerun` on your laptop,
 `ssh -R 9876:localhost:9876 <robot>` for the tunnel, then
 `inspect-robots run ... --rerun-connect` (a bare `--rerun-connect` targets the
 tunnel's localhost URL above; pass a URL to reach a viewer elsewhere). Viewer
-and SDK versions must match for live connections. Hosts driving two rigs give
-each config its own `rerun_port` so each run spawns its own viewer window.
+and SDK versions must match for live connections. For a replayable file without
+a live connection, use `--rerun-save`. Hosts driving two rigs give each config
+its own `rerun_port` so each run spawns its own viewer window.
+
+## Action side-cars
+
+Every delivered trial writes its executed action sequence to an atomic JSONL
+side-car by default:
+
+```
+actions/<run_id>/<sanitized_scene_id>-e<epoch>.jsonl
+```
+
+The first row identifies the run, raw scene id, epoch, action dimension, and
+optional dimension labels. Each remaining row records one control step and its
+post-approval action vector in order. This is the complete commanded trajectory,
+including the prefix of an errored or cancelled trial. A zero-step trial writes
+the header alone. The trial metadata stores the relative path in `actions`, so
+consumers should follow that pointer instead of reconstructing filenames.
+
+Action side-cars are owned by `eval()`, not a sink. They are therefore still
+written when `sinks=` replaces `JsonLogSink`. Pass `store_actions=False` to
+disable them. A filesystem failure emits a warning, leaves no final file or
+metadata pointer, and does not change the eval status. A non-finite policy
+action is rejected by the rollout before any step is recorded and errors the
+trial.
 
 ## Frame side-cars
 
@@ -122,6 +176,22 @@ a per-run subdirectory of `<log_dir>/frames` through a
 memory-safe and remain scorable from disk. Trial ids repeat across runs, so
 each eval gets its own directory; read the exact path from the log's
 `stats.frames_dir` rather than globbing `<log_dir>/frames` directly.
+
+The frame sequence includes both sides of every action. The reset observation
+is stored at index `0`; the result of step `t` is stored at `t + 1`. A camera
+present throughout a trial with `n` completed steps therefore produces `n + 1`
+files, including the terminal post-action state. In each
+[`StepRecord`](/api/#inspect_robots.rollout.StepRecord),
+`image_refs` points to the pre-action frames and `result_image_refs` points to
+the post-action frames. Both corresponding `Observation.images` mappings are
+empty while a frame store is active. Consumers must load the appropriate
+`FrameRef` instead of reading inline arrays. Without a frame store, observations
+remain inline and both ref mappings are `None`.
+
+Frame storage starts immediately after reset, before the first policy action.
+If the policy fails during its first decision, reset frames can remain on disk
+even though no `StepRecord` exists. This is intentional: the initial sensor
+state is still available for failure forensics.
 
 ```python
 eval(task, policy, embodiment, log_dir="logs", store_frames=True)
@@ -157,10 +227,11 @@ the placeholder in place.
 
 `FrameStore` sanitizes trial and camera names before building
 `{trial}_{camera}_{t:06d}.npy`. When the sanitizer rewrites a name, use
-`StepRecord.image_refs` and `FrameRef.path` as the authoritative mapping instead
-of assembling the path from the transcript label. That remains the right advice
-for programmatic consumers. The `view` command performs this join internally
-with the same sanitizer and an exact-match-or-degrade contract.
+`StepRecord.image_refs` for the pre-action observation,
+`StepRecord.result_image_refs` for the post-action observation, and
+`FrameRef.path` as the authoritative file mapping instead of assembling paths
+from transcript labels or step indices. The `view` command performs its join
+internally with the same sanitizer and an exact-match-or-degrade contract.
 
 ## Wire capture
 

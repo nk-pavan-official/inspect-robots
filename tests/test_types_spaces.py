@@ -228,6 +228,23 @@ def test_task_rejects_invalid_steps_horizon(max_steps: int) -> None:
         )
 
 
+def test_task_rejects_duplicate_scene_ids() -> None:
+    # Scene ids become per-trial identity (rollout builds "{scene.id}-e{epoch}",
+    # which FrameStore turns into a filename), so a duplicate silently
+    # overwrites another trial's stored frames (#289).
+    from inspect_robots.errors import ConfigError
+    from inspect_robots.scene import Scene
+    from inspect_robots.task import Task
+
+    with pytest.raises(ConfigError, match="duplicate scene id 'same'"):
+        Task(
+            name="t",
+            scenes=[Scene(id="same", instruction="x"), Scene(id="same", instruction="y")],
+            scorer="success_at_end",
+            max_steps=80,
+        )
+
+
 @pytest.mark.parametrize("max_seconds", [True, 0.0, -1.0, float("nan"), float("inf")])
 def test_task_rejects_invalid_seconds_horizon(max_seconds: float) -> None:
     from inspect_robots.errors import ConfigError
@@ -307,8 +324,17 @@ def test_task_validation_and_scorer_names() -> None:
         Task(name="t", scenes=[scene], scorer="success_at_end", max_steps=0)
     with pytest.raises(ConfigError, match="Epochs count"):
         Task(name="t", scenes=[scene], scorer="success_at_end", max_steps=5, epochs=0)
-    with pytest.raises(ConfigError, match="Epochs count"):
-        Epochs(count=0)
+    for invalid_count in (0, -1, True, False, 2.5, "1"):
+        with pytest.raises(ConfigError, match="Epochs count"):
+            Epochs(count=invalid_count)  # type: ignore[arg-type]
+        with pytest.raises(ConfigError, match="Epochs count"):
+            Task(
+                name="t",
+                scenes=[scene],
+                scorer="success_at_end",
+                max_steps=5,
+                epochs=invalid_count,  # type: ignore[arg-type]
+            )
 
     # A scorer registry name resolves to one scorer, never to a sequence of
     # one-character "scorers" (str is a Sequence).

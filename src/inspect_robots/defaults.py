@@ -19,6 +19,11 @@ comparing names.)
 ``INSPECT_ROBOTS_CONFIG`` selects the config file itself before the standard
 config-home derivation.
 
+One exception to the owner rule: ``taskgen_args`` (``[taskgen.args]``) has
+no owner. Automatic task generation is a single fixed function, not a
+registry-selected component, so there is no differently-selected component
+for its args to leak into; the section applies to every ``--auto-task`` run.
+
 A missing file yields empty defaults. A malformed or type-invalid file raises
 ``SystemExit`` naming the file, with a plain one-line message that callers may
 catch.
@@ -34,7 +39,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-__all__ = ["Defaults", "config_path", "load_defaults"]
+from inspect_robots._dotenv import init_dotenv
+
+__all__ = ["Defaults", "config_path", "init_dotenv", "load_defaults"]
 
 _ENV_CONFIG = "INSPECT_ROBOTS_CONFIG"
 _ENV_POLICY = "INSPECT_ROBOTS_POLICY"
@@ -84,13 +91,16 @@ class Defaults:
     sim_embodiment: str | None = None
     sim_embodiment_source: str | None = None
     scorer: str | None = None
+    grader: str | None = None
     max_steps: int | None = None
     store_frames: bool = False
     rerun: bool = False
+    rerun_save: bool = True
     rerun_port: int | None = None
     policy_args: dict[str, Any] = field(default_factory=dict)
     embodiment_args: dict[str, Any] = field(default_factory=dict)
     sim_embodiment_args: dict[str, Any] = field(default_factory=dict)
+    grader_args: dict[str, Any] = field(default_factory=dict)
     # The [<kind>.args] sections are written alongside the config file's
     # [defaults] component names; each args dict is only valid for that
     # component (its "owner", issue #44). Env vars override the names above
@@ -99,6 +109,11 @@ class Defaults:
     policy_args_owner: str | None = None
     embodiment_args_owner: str | None = None
     sim_embodiment_args_owner: str | None = None
+    grader_args_owner: str | None = None
+    # [taskgen.args] deliberately has no owner: automatic task generation is
+    # a single fixed function, never registry-selected, so the issue #44
+    # leak hazard cannot occur. Applies to every --auto-task run.
+    taskgen_args: dict[str, Any] = field(default_factory=dict)
 
 
 def config_path(env: Mapping[str, str]) -> Path | None:
@@ -171,6 +186,16 @@ def _read_config(path: Path) -> Defaults:
             raise _die(path, f"[defaults] rerun must be true or false, got {raw_rerun!r}")
         rerun = parsed_rerun
 
+    rerun_save = True
+    if raw_rerun_save := parser.get("defaults", "rerun_save", fallback=None):
+        parsed_rerun_save = _parse_value(raw_rerun_save)
+        if not isinstance(parsed_rerun_save, bool):
+            raise _die(
+                path,
+                f"[defaults] rerun_save must be true or false, got {raw_rerun_save!r}",
+            )
+        rerun_save = parsed_rerun_save
+
     rerun_port: int | None = None
     if raw_port := parser.get("defaults", "rerun_port", fallback=None):
         parsed_port = _parse_value(raw_port)
@@ -188,6 +213,7 @@ def _read_config(path: Path) -> Defaults:
     policy = parser.get("defaults", "policy", fallback=None)
     embodiment = parser.get("defaults", "embodiment", fallback=None)
     sim_embodiment = parser.get("defaults", "sim_embodiment", fallback=None)
+    grader = parser.get("defaults", "grader", fallback=None)
     return Defaults(
         policy=policy,
         policy_source=source if policy else None,
@@ -196,16 +222,21 @@ def _read_config(path: Path) -> Defaults:
         sim_embodiment=sim_embodiment,
         sim_embodiment_source=source if sim_embodiment else None,
         scorer=parser.get("defaults", "scorer", fallback=None),
+        grader=grader,
         max_steps=max_steps,
         store_frames=store_frames,
         rerun=rerun,
+        rerun_save=rerun_save,
         rerun_port=rerun_port,
         policy_args=_parse_args_section(parser, "policy.args"),
         embodiment_args=_parse_args_section(parser, "embodiment.args"),
         sim_embodiment_args=_parse_args_section(parser, "sim_embodiment.args"),
+        grader_args=_parse_args_section(parser, "grader.args"),
+        taskgen_args=_parse_args_section(parser, "taskgen.args"),
         policy_args_owner=policy,
         embodiment_args_owner=embodiment,
         sim_embodiment_args_owner=sim_embodiment,
+        grader_args_owner=grader,
     )
 
 
@@ -216,9 +247,11 @@ _CONFIG_KEYS = (
     "embodiment",
     "sim_embodiment",
     "scorer",
+    "grader",
     "max_steps",
     "store_frames",
     "rerun",
+    "rerun_save",
     "rerun_port",
 )
 
@@ -240,7 +273,7 @@ def _set_default(env: Mapping[str, str], key: str, value: str) -> Path:
         parsed = _parse_value(value)
         if not isinstance(parsed, int) or isinstance(parsed, bool) or not 1 <= parsed <= 65535:
             raise SystemExit(f"rerun_port must be an integer in 1-65535, got {value!r}")
-    if key in ("store_frames", "rerun") and not isinstance(_parse_value(value), bool):
+    if key in ("store_frames", "rerun", "rerun_save") and not isinstance(_parse_value(value), bool):
         raise SystemExit(f"{key} must be true or false, got {value!r}")
 
     path = config_path(env)
@@ -255,7 +288,7 @@ def _set_default(env: Mapping[str, str], key: str, value: str) -> Path:
             raise _die(path, f"malformed config: {exc}") from exc
     if not parser.has_section("defaults"):
         parser.add_section("defaults")
-    if key in ("policy", "embodiment", "sim_embodiment"):
+    if key in ("policy", "embodiment", "sim_embodiment", "grader"):
         old_value = parser.get("defaults", key, fallback=None)
         args_section = f"{key}.args"
         if (

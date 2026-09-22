@@ -524,6 +524,9 @@ class Toolset:
         *,
         target: npt.NDArray[np.float64] | None = None,
     ) -> ToolResult:
+        if actions:
+            last = actions[-1]
+            actions[-1] = Action(data=last.data, meta={**last.meta, "chunk_final": True})
         note = f"executing {self._move_tool} over {steps} steps"
         if self._hz is not None:
             note += f" ({steps / self._hz:.1f}s)"
@@ -600,6 +603,18 @@ def build_toolset(
                 "observation space to locate the proprioceptive reference"
             )
         matching = [field.key for field in state_spec.fields if field.shape == (dim,)]
+        if len(matching) > 1:
+            # An embodiment may expose several same-shaped state fields — e.g.
+            # a 14-D joint_pos next to a 14-D Cartesian eef_state. Prefer the
+            # field whose key prefix matches the control mode's family before
+            # declaring the shape ambiguous. Every ABSOLUTE_CONTROL_MODES
+            # member today is eef_* or joint_*; a future mode outside both
+            # families falls back to "joint" and, absent a joint_* field,
+            # still reaches the ambiguity error below.
+            family = "eef" if mode.startswith("eef") else "joint"
+            preferred = [key for key in matching if key.startswith(family)]
+            if len(preferred) == 1:
+                matching = preferred
         if len(matching) != 1:
             raise ToolsetError(
                 f"absolute-target control needs exactly one state field with shape "

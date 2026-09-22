@@ -39,6 +39,7 @@ if TYPE_CHECKING:
 from inspect_robots_agent._anthropic import _DEFAULT_MAX_OUTPUT_TOKENS, AnthropicClient
 from inspect_robots_agent._depth import depth_parts, resolve_depth
 from inspect_robots_agent._gemini_live import GeminiLiveClient
+from inspect_robots_agent._interactions import InteractionsClient
 from inspect_robots_agent._llm import (
     _DIRECT_PROVIDERS,
     _OPENROUTER_BASE,
@@ -57,6 +58,9 @@ from inspect_robots_agent._tools import PreCheck, Toolset, build_toolset
 from ._capture import WireCapture
 
 _MAX_CONSECUTIVE_FAILURES = 3
+# Shared by the camera label writer and the reader that recovers revealed
+# camera names from it, so the two cannot drift apart again.
+_CAMERA_LABEL_PREFIX = "camera "
 
 #: Anthropic's base URL, allowlisted by the Messages-endpoint guard below.
 _ANTHROPIC_BASE = _DIRECT_PROVIDERS["anthropic"].base_url
@@ -70,13 +74,24 @@ _GEMINI_LIVE_BASE = (
     "google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent"
 )
 
+#: Google's native stateful HTTP endpoint, after direct-provider resolution.
+_INTERACTIONS_BASE = "https://generativelanguage.googleapis.com/v1beta"
+
 # reasoning_effort values accepted across OpenAI-compatible endpoints
 # (Anthropic compat maps these to thinking effort; OpenRouter forwards them).
-# The Messages wire reuses the set as output_config.effort. Anthropic rejects
-# "none"/"minimal", and its endpoint requires streaming for the cap xhigh/max
+# The Messages wire reuses the set: "none" becomes thinking-disabled client-side
+# and the rest go out as output_config.effort, of which Anthropic rejects
+# "minimal", and its endpoint requires streaming for the cap xhigh/max
 # need; Tinker accepts xhigh/max without streaming. Rejections get guided errors.
 _EFFORT_LEVELS = frozenset({"none", "minimal", "low", "medium", "high", "xhigh", "max"})
-_WIRE_FORMATS = frozenset({"chat", "responses", "messages", "gemini-live"})
+# Some servers also take a continuous effort alongside the named levels: Tinker's
+# OpenAI-compatible endpoint accepts a fraction (probed 2026-08-06 — 0.0 through
+# 0.99 return 200, 0.995 and above 422). A fraction is passed through untouched
+# rather than quantized into a level, so a sweep keeps the resolution the server
+# offers. The range is half-open by construction: 1.0 means "past max effort",
+# and servers that cap lower reject it with a guided 4xx.
+_EFFORT_FRACTION_LIMIT = 1.0
+_WIRE_FORMATS = frozenset({"chat", "responses", "messages", "gemini-live", "interactions"})
 _WIRE_ALIASES = {"anthropic": "messages"}
 _AGENT_NATIVE_WIRES = frozenset({"chat", "messages"})
 _MESSAGES_CAPABLE_PREFIXES = frozenset(
@@ -144,6 +159,33 @@ _PRE_CHECK_PROMPT_CLAUSE = (
 _ON_DEMAND_NUDGE = (
     "Respond with one motion tool call, one motion followed by take_pic, or take_pic alone."
 )
+
+
+def _validated_effort(effort: object) -> str | float:
+    """Return the wire value for an accepted effort, else raise ``ConfigError``.
+
+    Accepts a named level verbatim, or a number in ``[0.0, 1.0)`` normalized to
+    ``float`` for the servers that read effort as a fraction. ``bool`` is not a
+    number here: ``-P effort=false`` parses to ``False``, which would otherwise
+    silently mean zero effort instead of failing as the typo it is.
+    """
+    if isinstance(effort, str):
+        if effort in _EFFORT_LEVELS:
+            return effort
+    # The range check rejects nan and inf too: every nan comparison is False, and
+    # inf fails the upper bound.
+    elif (
+        isinstance(effort, int | float)
+        and not isinstance(effort, bool)
+        and 0.0 <= effort < _EFFORT_FRACTION_LIMIT
+    ):
+        return float(effort)
+    raise ConfigError(
+        f"effort must be one of {sorted(_EFFORT_LEVELS)}, or a number in "
+        f"[0.0, {_EFFORT_FRACTION_LIMIT}) on servers that take a fractional "
+        f"effort, got {effort!r}.\n"
+        "fix: omit -P effort= to use the provider default"
+    )
 
 
 def _sanitize(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -233,7 +275,10 @@ class AgentPolicyConfig(PolicyConfig):
     #: wires, where nothing constrained the output.
     max_output_tokens: int | None = None
     max_llm_calls: int = 100
-    effort: str | None = "low"
+    #: Resolved effort level; ``None`` means the field is omitted and the
+    #: provider default applies. A number is a fractional effort, recorded as
+    #: sent rather than snapped to a level.
+    effort: str | float | None = None
     max_speed_frac: float = 0.1
     transcript_echo: bool = False
     images: str = "always"
@@ -284,7 +329,7 @@ class LLMAgentPolicy(PolicyBase):
         max_output_tokens: int | None = None,
         max_llm_calls: int = 100,
         temperature: float | None = None,
-        effort: str | None | _Unset = _UNSET,
+        effort: str | float | None | _Unset = _UNSET,
         max_speed_frac: float = 0.1,
         transcript_echo: bool = False,
         images: str = "always",
@@ -295,6 +340,21 @@ class LLMAgentPolicy(PolicyBase):
         env: dict[str, str] | None = None,
         pre_check: PreCheck | None = None,
     ) -> None:
+        # Reject non-strings with a guided ConfigError to prevent unquoted CLI
+        # values (e.g. -P model=42) from causing downstream errors or silent bypasses.
+        for name, val in [
+            ("model", model),
+            ("base_url", base_url),
+            ("api_key_env", api_key_env),
+            ("speed", speed),
+        ]:
+            if val is not None and not isinstance(val, str):
+                raise ConfigError(
+                    f"{name} must be a string, got {val!r}.\n"
+                    f"fix: the -P parser coerces unquoted values; pass "
+                    f"-P '{name}=\"value\"'"
+                )
+
         prior_learnings_path: str | None = None
         prior_learnings_text: str | None = None
         prior_learnings_sha256: str | None = None
@@ -373,17 +433,25 @@ class LLMAgentPolicy(PolicyBase):
             wire = _WIRE_ALIASES.get(wire, wire)
             if wire not in _WIRE_FORMATS:
                 raise ConfigError(f"wire must be one of {sorted(_WIRE_FORMATS)}, got {wire!r}")
-        if effort is not _UNSET and effort is not None and effort not in _EFFORT_LEVELS:
-            raise ConfigError(
-                f"effort must be one of {sorted(_EFFORT_LEVELS)}, or None to omit "
-                f"the field, got {effort!r}"
-            )
-        resolved_effort: str | None = None if wire == "gemini-live" else "low"
+        resolved_effort: str | float | None = None
         if not isinstance(effort, _Unset):
-            resolved_effort = effort
-        if wire == "gemini-live" and effort is not _UNSET and effort is not None:
+            resolved_effort = _validated_effort("none" if effort is None else effort)
+        if wire == "gemini-live" and effort is not _UNSET:
             raise ConfigError(
                 "effort is not supported on wire='gemini-live'.\nfix: drop -P effort="
+            )
+        if wire == "interactions" and resolved_effort not in {
+            None,
+            "minimal",
+            "low",
+            "medium",
+            "high",
+        }:
+            raise ConfigError(
+                "effort on wire='interactions' must be minimal, low, medium, or high, "
+                f"got {resolved_effort!r}.\n"
+                "fix: pass -P effort=minimal|low|medium|high (maps to thinking_level), "
+                "or drop -P effort="
             )
         if speed is not None and speed not in _SPEEDS:
             raise ConfigError(f"speed must be one of {sorted(_SPEEDS)}, or None, got {speed!r}")
@@ -431,7 +499,7 @@ class LLMAgentPolicy(PolicyBase):
                 "image_horizon must be an int >= 1, or None to send full image history.\n"
                 "fix: pass -P image_horizon=N or -P image_horizon=none"
             )
-        resolved_image_horizon: int | None = None if wire == "gemini-live" else 2
+        resolved_image_horizon: int | None = None if wire in {"gemini-live", "interactions"} else 2
         if not isinstance(image_horizon, _Unset):
             resolved_image_horizon = image_horizon
         if wire == "gemini-live" and image_horizon is not _UNSET and image_horizon is not None:
@@ -441,12 +509,25 @@ class LLMAgentPolicy(PolicyBase):
                 "compression is the equivalent mechanism because already-streamed "
                 "frames cannot be evicted"
             )
+        if wire == "interactions" and image_horizon is not _UNSET and image_horizon is not None:
+            raise ConfigError(
+                "image_horizon is not supported on wire='interactions'.\n"
+                "fix: drop -P image_horizon=; the Interactions API's server-side history "
+                "is the equivalent mechanism because frames already absorbed by the chain "
+                "cannot be evicted client-side"
+            )
 
         if wire == "gemini-live" and base_url and not base_url.startswith(("ws://", "wss://")):
             raise ConfigError(
                 "wire='gemini-live' requires a ws:// or wss:// base_url, got "
                 f"{base_url!r}.\nfix: drop -P base_url= to use Google's Live API, "
                 "or pass a websocket endpoint"
+            )
+        if wire == "interactions" and base_url and not base_url.startswith(("http://", "https://")):
+            raise ConfigError(
+                "wire='interactions' requires an http:// or https:// base_url, got "
+                f"{base_url!r}.\nfix: wire='interactions' is HTTP; drop -P base_url= "
+                "or pass the Live wire a websocket endpoint via -P wire=gemini-live"
             )
 
         # resolve_provider reads api_key_env only when base_url is set, where
@@ -463,6 +544,8 @@ class LLMAgentPolicy(PolicyBase):
             effective_key_env = "ANTHROPIC_API_KEY"
         if wire == "gemini-live" and base_url and not api_key_env:
             effective_key_env = "GEMINI_API_KEY"
+        if wire == "interactions" and base_url and not api_key_env:
+            effective_key_env = "GEMINI_API_KEY"
         try:
             provider = resolve_provider(
                 model=requested_model,
@@ -472,8 +555,13 @@ class LLMAgentPolicy(PolicyBase):
                 native_wires=_AGENT_NATIVE_WIRES,
             )
         except ConfigError as exc:
-            if wire != "gemini-live" or base_url:
+            if wire not in {"gemini-live", "interactions"} or base_url:
                 raise
+            if wire == "interactions":
+                raise ConfigError(
+                    "wire='interactions' needs Google's direct provider.\n"
+                    "fix: use -P model=google/... and set $GEMINI_API_KEY"
+                ) from exc
             raise ConfigError(
                 "wire='gemini-live' needs Google's direct Live API provider.\n"
                 "fix: use -P model=google/... and set $GEMINI_API_KEY"
@@ -576,6 +664,17 @@ class LLMAgentPolicy(PolicyBase):
                 api_key=provider.api_key,
                 model=provider.model,
             )
+        if wire == "interactions" and not base_url:
+            if provider.base_url != _GOOGLE_BASE:
+                raise ConfigError(
+                    "wire='interactions' needs Google's direct provider.\n"
+                    "fix: use -P model=google/... and set $GEMINI_API_KEY"
+                )
+            provider = Provider(
+                base_url=_INTERACTIONS_BASE,
+                api_key=provider.api_key,
+                model=provider.model,
+            )
 
         resolved_max_output_tokens = (
             (max_output_tokens if max_output_tokens is not None else _DEFAULT_MAX_OUTPUT_TOKENS)
@@ -583,7 +682,9 @@ class LLMAgentPolicy(PolicyBase):
             else None
         )
         self._capture = WireCapture() if wire_capture else None
-        self._client: ChatClient | ResponsesClient | AnthropicClient | GeminiLiveClient
+        self._client: (
+            ChatClient | ResponsesClient | AnthropicClient | GeminiLiveClient | InteractionsClient
+        )
         if wire == "messages":
             assert resolved_max_output_tokens is not None
             self._client = AnthropicClient(
@@ -597,13 +698,14 @@ class LLMAgentPolicy(PolicyBase):
             self._client = ResponsesClient(provider, transport=transport, capture=self._capture)
         elif wire == "gemini-live":
             self._client = GeminiLiveClient(provider, capture=self._capture)
+        elif wire == "interactions":
+            self._client = InteractionsClient(provider, transport=transport, capture=self._capture)
         else:
             self._client = ChatClient(provider, transport=transport, capture=self._capture)
         self._max_llm_calls = max_llm_calls
         self._temperature = temperature
-        # Robot control is latency-sensitive: default to low reasoning effort
-        # (the arm stands still while the model thinks; safety guardrails sit
-        # below the model, so effort trades thinking time, not safety).
+        # Preserve the operator's requested effort exactly; when it is unset,
+        # omit the field so the provider's own default applies.
         self._effort = resolved_effort
         self._max_speed_frac = max_speed_frac
         self._transcript_echo = transcript_echo
@@ -919,10 +1021,18 @@ class LLMAgentPolicy(PolicyBase):
                                                 and part.get("type") == "text"
                                             ):
                                                 text = part.get("text", "")
-                                                if text.startswith("camera '"):
-                                                    end_quote = text.find("'", 8)
-                                                    if end_quote != -1:
-                                                        active_camera_names.add(text[8:end_quote])
+                                                # The label is written with !r, and
+                                                # repr() uses double quotes for a
+                                                # name holding an apostrophe, so
+                                                # accept whichever quote it chose.
+                                                start = len(_CAMERA_LABEL_PREFIX) + 1
+                                                quote = text[start - 1 : start]
+                                                if (
+                                                    text.startswith(_CAMERA_LABEL_PREFIX)
+                                                    and quote in ("'", '"')
+                                                    and (end := text.find(quote, start)) != -1
+                                                ):
+                                                    active_camera_names.add(text[start:end])
                                 self._revealed.intersection_update(active_camera_names)
 
                             skipped = tuple(name for name in requested if name in self._revealed)
@@ -1176,7 +1286,7 @@ def _image_parts(
         image = observation.images.get(name)
         if image is None:
             continue
-        parts.append({"type": "text", "text": f"camera {name!r}{suffix}:"})
+        parts.append({"type": "text", "text": f"{_CAMERA_LABEL_PREFIX}{name!r}{suffix}:"})
         parts.append({"type": "image_url", "image_url": {"url": png_data_url(image)}})
         if depth is not None and name in depth:
             parts.extend(depth_parts(name, depth[name], step_label))

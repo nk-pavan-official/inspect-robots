@@ -11,7 +11,10 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass, field
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from inspect_robots.rollout import TrialRecord
 
 EventKind = str  # Includes reset, inference, step, approval, operator_message, operator, error.
 
@@ -49,12 +52,12 @@ def approval_event(t: int, modified: bool, detail: str | None = None) -> Event:
     return Event(kind="approval", t=t, data={"modified": modified, "detail": detail})
 
 
-def operator_message_event(t: int, text: str) -> Event:
-    """Record live feedback typed at the console during the trial.
+def operator_message_event(t: int, text: str, source: str = "console") -> Event:
+    """Record live feedback typed at the console or spoken in voice mode.
 
     This is distinct from the post-hoc operator verdict event.
     """
-    return Event(kind="operator_message", t=t, data={"text": text})
+    return Event(kind="operator_message", t=t, data={"text": text, "source": source})
 
 
 def operator_event(t: int, verdict: str, source: str = "prompt", note: str | None = None) -> Event:
@@ -70,6 +73,21 @@ def operator_event(t: int, verdict: str, source: str = "prompt", note: str | Non
         t=t,
         data={"verdict": verdict, "source": source, "note": note},
     )
+
+
+def judgement_source(record: TrialRecord) -> str | None:
+    """Return which path produced the record's judgement.
+
+    ``None`` when the record has no ``operator_judgement``, or when the
+    judgement was set without an ``operator`` event; otherwise the ``source``
+    of the last ``operator`` event ("console", "prompt", "embodiment", "vlm").
+    """
+    if record.operator_judgement is None:
+        return None
+    for event in reversed(record.events):
+        if event.kind == "operator":
+            return event.data.get("source")
+    return None
 
 
 def error_event(t: int, error_type: str, message: str) -> Event:
